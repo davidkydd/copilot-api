@@ -11,9 +11,9 @@ export const MODEL_NOT_ALLOWED_ERROR = {
 } as const
 
 /**
- * Raised by request handlers for the effective model selected after mappings
- * and any provider prefix are accounted for. `forwardError` turns this into
- * the stable 400 response above.
+ * Raised by request handlers for the effective mapped model, with any provider
+ * qualification accounted for. `forwardError` turns this into the stable 400
+ * response above.
  */
 export class ModelNotAllowedError extends Error {
   constructor() {
@@ -42,9 +42,9 @@ export function normalizeModelIdForAdmission(modelId: string): string {
 /**
  * Return the family-bearing portion of a provider-qualified model ID.
  *
- * Top-level aliases are resolved before this function is called, but provider
- * model IDs can themselves be namespaced (for example `openai/gpt-5.4`). The
- * last non-empty segment is therefore the authoritative family identifier.
+ * Top-level aliases and provider model IDs can both be namespaced (for example
+ * `openrouter/openai/gpt-5.4`). The last non-empty segment is therefore the
+ * authoritative family identifier.
  */
 function getModelFamilyId(modelId: string): string {
   return modelId.split("/").filter(Boolean).at(-1) ?? ""
