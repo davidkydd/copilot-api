@@ -11,7 +11,6 @@ import {
   type CompactType,
 } from "~/lib/compact"
 import { getReasoningEffortForModel } from "~/lib/config"
-import { normalizeSdkModelId } from "~/lib/models"
 
 import type {
   AnthropicAssistantContentBlock,
@@ -32,9 +31,6 @@ export const TOOL_REFERENCE_TURN_BOUNDARY = "Tool loaded."
 const SYSTEM_REMINDER_START = "<system-reminder>"
 const SYSTEM_REMINDER_END = "</system-reminder>"
 const SUBAGENT_START_HOOK_ADDITIONAL_PREFIX = "SubagentStart hook additional"
-export const claudeAutoModelSystemPromptStart =
-  "You are a security monitor for autonomous AI coding agents."
-export const claudeAutoModelStopSequence = "</block>"
 
 const IDE_GET_DIAGNOSTICS_TOOL = "mcp__ide__getDiagnostics"
 const IDE_GET_DIAGNOSTICS_DESCRIPTION =
@@ -234,28 +230,6 @@ export const normalizeSystemMessages = (
   payload.system = system
 }
 
-const isVersionAtLeast = (
-  version: string,
-  minimumMajor: number,
-  minimumMinor: number,
-): boolean => {
-  const [majorPart, minorPart = "0"] = version.split(".")
-  const major = Number.parseInt(majorPart, 10)
-  const minor = Number.parseInt(minorPart, 10)
-  if (!Number.isInteger(major) || !Number.isInteger(minor)) {
-    return false
-  }
-
-  return (
-    major > minimumMajor || (major === minimumMajor && minor >= minimumMinor)
-  )
-}
-
-const shouldSummarizeThinkingDisplayForModel = (model: string): boolean => {
-  const normalized = normalizeSdkModelId(model)
-  return Boolean(normalized && isVersionAtLeast(normalized.version, 4, 7))
-}
-
 type IndexedAttachment = {
   attachment: AnthropicAttachmentBlock
   order: number
@@ -386,42 +360,6 @@ export const getCompactType = (
   }
 
   return 0
-}
-
-/**
- * True for Claude Code background security-monitor requests: no tools,
- * `stop_sequences: ["</block>"]`, and a system prompt starting with the
- * security-monitor prefix. These can be rerouted via `claudeAutoModel`.
- */
-export const isClaudeAutoModelRequest = (
-  payload: AnthropicMessagesPayload,
-): boolean => {
-  if (payload.tools && payload.tools.length > 0) {
-    return false
-  }
-
-  const stopSequences = payload.stop_sequences
-  if (
-    !Array.isArray(stopSequences)
-    || stopSequences.length !== 1
-    || stopSequences[0] !== claudeAutoModelStopSequence
-  ) {
-    return false
-  }
-
-  const system = payload.system
-  if (typeof system === "string") {
-    return system.startsWith(claudeAutoModelSystemPromptStart)
-  }
-  if (!Array.isArray(system)) {
-    return false
-  }
-
-  return system.some(
-    (block) =>
-      typeof block.text === "string"
-      && block.text.startsWith(claudeAutoModelSystemPromptStart),
-  )
 }
 
 const mergeContentWithText = (
@@ -882,8 +820,8 @@ const stripToolEagerInputStreaming = (
   }
 }
 
-// Pre-request processing: filter thinking blocks for Claude models so only
-// valid thinking blocks are sent to the Copilot Messages API.
+// Filter thinking blocks so only signatures accepted by the Copilot
+// Anthropic-compatible Messages API are forwarded.
 const filterAssistantThinkingBlocks = (
   payload: AnthropicMessagesPayload,
 ): void => {
@@ -931,9 +869,6 @@ export const prepareMessagesApiPayload = (
     }
     // align with vscode copilot
     if (!hasThinking) {
-      payload.thinking.display = "summarized"
-    }
-    if (shouldSummarizeThinkingDisplayForModel(payload.model)) {
       payload.thinking.display = "summarized"
     }
     let effort =

@@ -1,6 +1,7 @@
 import { Hono, type Context } from "hono"
 import consola from "consola"
 
+import { readBodyWithLimit } from "~/lib/bounded-body"
 import {
   getAlphaSearchModel,
   isAlphaSearchCodexPriorityEnabled,
@@ -10,6 +11,7 @@ import {
 } from "~/lib/config"
 import { forwardError } from "~/lib/error"
 import { createHandlerLogger, debugJsonAsync } from "~/lib/logger"
+import { assertAllowedModel } from "~/lib/model-admission"
 import { findEndpointModel } from "~/lib/models"
 import { parseProviderModelAlias } from "~/lib/provider-model"
 import {
@@ -27,6 +29,8 @@ import { createProviderProxyResponse } from "~/services/providers/provider-proxy
 const logger = createHandlerLogger("alpha-search-handler")
 
 export const alphaSearchRoutes = new Hono()
+
+export const MAX_ALPHA_SEARCH_BODY_SIZE_BYTES = 10 * 1024 * 1024
 
 export const alphaSearchRouteDependencies = {
   findEndpointModel,
@@ -65,7 +69,7 @@ async function forwardCodexAlphaSearchRequest(
   return createProviderProxyResponse(upstreamResponse)
 }
 
-function createAlphaSearchRequest(
+export function createAlphaSearchRequest(
   request: Request,
   payload: AlphaSearchRequest,
 ): Request {
@@ -73,9 +77,11 @@ function createAlphaSearchRequest(
   // wraps incoming requests in a proxy class whose prototype chain satisfies
   // `instanceof Request` without the native internals, so `new Request(req)`
   // throws "Cannot read properties of undefined (reading 'window')".
+  const headers = new Headers(request.headers)
+  headers.delete("content-length")
   return new Request(request.url, {
     body: JSON.stringify(payload),
-    headers: request.headers,
+    headers,
     method: request.method,
     signal: request.signal,
   })
@@ -116,14 +122,33 @@ function invalidRequest(c: Context, message: string): Response {
   )
 }
 
-async function parseAlphaSearchBody(
+function getRequestBody(request: Request): ReadableStream<Uint8Array> | null {
+  try {
+    return request.body
+  } catch {
+    return request.clone().body
+  }
+}
+
+export async function parseAlphaSearchBody(
   c: Context,
 ): Promise<AlphaSearchRequest | Response> {
   let body: unknown
   try {
-    body = await c.req.raw.clone().json()
-  } catch {
-    return invalidRequest(c, "Invalid alpha search request: expected JSON body")
+    const bodyBytes = await readBodyWithLimit(
+      getRequestBody(c.req.raw),
+      MAX_ALPHA_SEARCH_BODY_SIZE_BYTES,
+      c.req.header("content-length"),
+    )
+    body = JSON.parse(new TextDecoder().decode(bodyBytes))
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      return invalidRequest(
+        c,
+        "Invalid alpha search request: expected JSON body",
+      )
+    }
+    throw error
   }
 
   const model = (body as AlphaSearchRequest | null)?.model
@@ -145,12 +170,17 @@ export async function handleAlphaSearchRequest(
   c: Context,
   resolvedProviderConfig?: ResolvedProviderConfig,
 ): Promise<Response> {
-  if (resolvedProviderConfig) {
-    return await handleCodexRequest(c, c.req.raw, resolvedProviderConfig)
-  }
-
   const payload = await parseAlphaSearchBody(c)
   if (payload instanceof Response) return payload
+
+  if (resolvedProviderConfig) {
+    assertAllowedModel(payload.model)
+    return await handleCodexRequest(
+      c,
+      createAlphaSearchRequest(c.req.raw, payload),
+      resolvedProviderConfig,
+    )
+  }
 
   const requestedModel = payload.model
 
@@ -161,6 +191,7 @@ export async function handleAlphaSearchRequest(
       `Resolved model mapping: ${requestedModel} -> ${payload.model}`,
     )
   }
+  assertAllowedModel(payload.model)
 
   const resolvedRequestedModel = payload.model
   let providerModelAlias = parseProviderModelAlias(payload.model)
@@ -200,6 +231,7 @@ export async function handleAlphaSearchRequest(
     }
     const resolvedSearchModel =
       alphaSearchRouteDependencies.resolveMappedModel(searchModel)
+    assertAllowedModel(resolvedSearchModel)
     if (!(await isNativeResponsesModel(resolvedSearchModel))) {
       return invalidRequest(
         c,

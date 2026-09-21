@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 import { Hono } from "hono"
 
 import type { ResolvedProviderConfig } from "~/lib/config"
+import { MAX_IMAGE_GENERATION_BODY_SIZE_BYTES } from "~/routes/images/parsed-request"
 import { MultipartBodyTooLargeError } from "~/routes/images/temp-form-data"
 
 const actualConfigModule = await import("~/lib/config")
@@ -218,16 +219,31 @@ describe("Codex images forwarding", () => {
     expect(await new Response(init?.body).json()).toEqual(payload)
   })
 
+  test("rebuilds unchanged generation bodies with one validated model", async () => {
+    const response = await createApp().request("/v1/images/generations", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: '{"model":"claude-image-1","model":"gpt-image-2","prompt":"safe"}',
+    })
+
+    expect(response.status).toBe(200)
+    const [, init] = fetchMock.mock.calls[0] ?? []
+    expect(await new Response(init?.body).json()).toEqual({
+      model: "gpt-image-2",
+      prompt: "safe",
+    })
+  })
+
   test("rewrites a mapped JSON generation model before forwarding to Codex", async () => {
     modelMappings = {
-      "image-model": "gpt-image-2",
+      "gpt-image-1": "gpt-image-2",
     }
 
     const response = await createApp().request("/v1/images/generations", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "image-model",
+        model: "gpt-image-1",
         prompt: "mapped Codex image",
       }),
     })
@@ -244,7 +260,7 @@ describe("Codex images forwarding", () => {
   test("routes a mapped JSON generation model to its configured provider", async () => {
     codexProviderConfig = null
     modelMappings = {
-      "image-model": "openrouter/black-forest-labs/flux-1.1-pro",
+      "gpt-image-1": "openrouter/openai/gpt-image-1",
     }
 
     const response = await createApp().request(
@@ -253,7 +269,7 @@ describe("Codex images forwarding", () => {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          model: "image-model",
+          model: "gpt-image-1",
           prompt: "mapped provider image",
         }),
       },
@@ -269,7 +285,7 @@ describe("Codex images forwarding", () => {
     expect(headers.get("authorization")).toBe("Bearer openrouter-key")
     expect(headers.has("chatgpt-account-id")).toBe(false)
     expect(await new Response(init?.body).json()).toEqual({
-      model: "black-forest-labs/flux-1.1-pro",
+      model: "openai/gpt-image-1",
       prompt: "mapped provider image",
     })
   })
@@ -277,14 +293,14 @@ describe("Codex images forwarding", () => {
   test("forwards the original model to Codex when the mapped provider is unavailable", async () => {
     openrouterProviderConfig = null
     modelMappings = {
-      "image-model": "openrouter/black-forest-labs/flux-1.1-pro",
+      "gpt-image-1": "openrouter/openai/gpt-image-1",
     }
 
     const response = await createApp().request("/v1/images/generations", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "image-model",
+        model: "gpt-image-1",
         prompt: "fallback to original model",
       }),
     })
@@ -295,7 +311,7 @@ describe("Codex images forwarding", () => {
     const headers = new Headers(init?.headers)
     expect(headers.get("authorization")).toBe("Bearer codex-access-token")
     expect(await new Response(init?.body).json()).toEqual({
-      model: "image-model",
+      model: "gpt-image-1",
       prompt: "fallback to original model",
     })
   })
@@ -347,7 +363,7 @@ describe("Codex images forwarding", () => {
 
   test("routes a mapped multipart edit model to its configured provider", async () => {
     modelMappings = {
-      "edit-model": "openrouter/black-forest-labs/flux-kontext-pro",
+      "edit-model": "openrouter/openai/gpt-image-1",
     }
     const formData = new FormData()
     formData.set("model", "edit-model")
@@ -375,9 +391,7 @@ describe("Codex images forwarding", () => {
     const forwardedFormData = await new Response(init?.body, {
       headers,
     }).formData()
-    expect(forwardedFormData.get("model")).toBe(
-      "black-forest-labs/flux-kontext-pro",
-    )
+    expect(forwardedFormData.get("model")).toBe("openai/gpt-image-1")
     expect(forwardedFormData.get("prompt")).toBe("mapped provider edit")
     const image = forwardedFormData.get("image")
     expect(image).not.toBeNull()
@@ -483,11 +497,11 @@ describe("Codex images forwarding", () => {
 
   test("does not rewrite JSON-shaped generation bodies with invalid UTF-8", async () => {
     modelMappings = {
-      "image-model": "gpt-image-2",
+      "gpt-image-1": "gpt-image-2",
     }
     const encoder = new TextEncoder()
     const body = new Uint8Array([
-      ...encoder.encode('{"model":"image-model","prompt":"'),
+      ...encoder.encode('{"model":"gpt-image-1","prompt":"'),
       0xff,
       ...encoder.encode('"}'),
     ])
@@ -523,6 +537,31 @@ describe("Codex images forwarding", () => {
       model: "gpt-image-2",
       prompt: "headerless JSON",
     })
+  })
+
+  test("rejects oversized provider generation bodies before forwarding", async () => {
+    const request = new Request(
+      "http://localhost/openrouter/v1/images/generations",
+      {
+        method: "POST",
+        headers: {
+          "content-length": String(MAX_IMAGE_GENERATION_BODY_SIZE_BYTES + 1),
+          "content-type": "application/json",
+        },
+        body: "{}",
+      },
+    )
+
+    const response = await createApp().request(request)
+
+    expect(response.status).toBe(413)
+    expect(await response.json()).toEqual({
+      error: {
+        message: `Body exceeds the configured size limit of ${MAX_IMAGE_GENERATION_BODY_SIZE_BYTES} bytes`,
+        type: "invalid_request_error",
+      },
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   test("returns 413 when multipart staging exceeds its limits", async () => {
@@ -643,7 +682,7 @@ describe("Codex images forwarding", () => {
   })
 
   test("supports the provider-scoped images generations route", async () => {
-    const payload = { prompt: "provider path" }
+    const payload = { model: "gpt-image-1", prompt: "provider path" }
 
     const response = await createApp().request(
       "/codex/v1/images/generations?output=base64",
@@ -661,8 +700,65 @@ describe("Codex images forwarding", () => {
     )
   })
 
+  test("cleans staged provider edits immediately when the model is missing", async () => {
+    const cleanup = mock(() => Promise.resolve())
+    const scheduleCleanup = mock(() => {})
+    imageEditsRouteDependencies.stageMultipartBodyToDisk = () =>
+      Promise.resolve({
+        cleanup,
+        directory: "unused",
+        formData: new FormData(),
+        scheduleCleanup,
+      })
+
+    const response = await createApp().request("/openrouter/v1/images/edits", {
+      method: "POST",
+      body: new FormData(),
+    })
+
+    expect(response.status).toBe(400)
+    expect(cleanup).toHaveBeenCalledTimes(1)
+    expect(scheduleCleanup).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test("rejects Claude models on provider-scoped image routes", async () => {
+    const response = await createApp().request(
+      "/openrouter/v1/images/generations",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "CLAUDE-image-1",
+          prompt: "blocked",
+        }),
+      },
+    )
+
+    expect(response.status).toBe(400)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  test("rebuilds provider generation bodies with one validated model", async () => {
+    const response = await createApp().request(
+      "/openrouter/v1/images/generations",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"claude-image-1","model":"gpt-image-2","prompt":"safe"}',
+      },
+    )
+
+    expect(response.status).toBe(200)
+    const [, init] = fetchMock.mock.calls[0] ?? []
+    expect(await new Response(init?.body).json()).toEqual({
+      model: "gpt-image-2",
+      prompt: "safe",
+    })
+  })
+
   test("proxies non-codex providers on the provider-scoped images route", async () => {
-    const payload = { prompt: "generic provider image" }
+    const payload = { model: "gpt-image-1", prompt: "generic provider image" }
 
     const response = await createApp().request(
       "/openrouter/v1/images/generations?output=base64",
@@ -689,6 +785,31 @@ describe("Codex images forwarding", () => {
     expect(headers.get("authorization")).toBe("Bearer openrouter-key")
     expect(headers.get("content-type")).toBe("application/json")
     expect(await new Response(init?.body).json()).toEqual(payload)
+  })
+
+  test("forwards one validated model in provider image edits", async () => {
+    const formData = new FormData()
+    formData.append("model", "gpt-image-2")
+    formData.append("model", "claude-image-1")
+    formData.set("prompt", "generic edit")
+    formData.set(
+      "image",
+      new Blob(["source-image-bytes"], { type: "image/png" }),
+      "source.png",
+    )
+
+    const response = await createApp().request("/openrouter/v1/images/edits", {
+      method: "POST",
+      body: formData,
+    })
+
+    expect(response.status).toBe(200)
+    const [, init] = fetchMock.mock.calls[0] ?? []
+    const headers = new Headers(init?.headers)
+    const forwardedFormData = await new Response(init?.body, {
+      headers,
+    }).formData()
+    expect(forwardedFormData.getAll("model")).toEqual(["gpt-image-2"])
   })
 
   test("preserves multipart content-type for non-codex provider image edits", async () => {

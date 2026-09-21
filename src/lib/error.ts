@@ -3,12 +3,28 @@ import type { ContentfulStatusCode } from "hono/utils/http-status"
 
 import consola from "consola"
 
+import { BodySizeLimitExceededError } from "~/lib/bounded-body"
+import {
+  MODEL_NOT_ALLOWED_ERROR,
+  ModelNotAllowedError,
+} from "~/lib/model-admission"
+
 export class HTTPError extends Error {
   response: Response
 
   constructor(message: string, response: Response) {
     super(message)
     this.response = response
+  }
+}
+
+export class UpstreamResponseSizeLimitExceededError extends Error {
+  readonly maxBytes: number
+
+  constructor(maxBytes: number) {
+    super(`Upstream response exceeds the size limit of ${maxBytes} bytes`)
+    this.name = "UpstreamResponseSizeLimitExceededError"
+    this.maxBytes = maxBytes
   }
 }
 
@@ -36,6 +52,35 @@ export async function forwardError(
   c: Context,
   error: unknown,
 ): Promise<Response> {
+  if (error instanceof ModelNotAllowedError) {
+    return c.json({ error: MODEL_NOT_ALLOWED_ERROR }, 400)
+  }
+
+  if (error instanceof BodySizeLimitExceededError) {
+    return c.json(
+      {
+        error: {
+          message: error.message,
+          type: "invalid_request_error",
+        },
+      },
+      413,
+    )
+  }
+
+  if (error instanceof UpstreamResponseSizeLimitExceededError) {
+    consola.error("Error occurred:", error)
+    return c.json(
+      {
+        error: {
+          message: error.message,
+          type: "upstream_error",
+        },
+      },
+      502,
+    )
+  }
+
   if (
     error instanceof UpstreamHeadersTimeoutError
     || error instanceof UpstreamStreamInactivityTimeoutError

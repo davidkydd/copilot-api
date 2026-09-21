@@ -4,6 +4,7 @@ import type { Context } from "hono"
 import { resolveMappedModel, type ResolvedProviderConfig } from "~/lib/config"
 import { forwardError } from "~/lib/error"
 import { createHandlerLogger, debugJson, debugJsonAsync } from "~/lib/logger"
+import { assertAllowedModel } from "~/lib/model-admission"
 import { parseProviderModelAlias } from "~/lib/provider-model"
 import { resolveProviderConfig } from "~/lib/provider-resolver"
 import { forwardProviderImagesWithLogging } from "~/routes/images/forward-provider-images"
@@ -25,8 +26,6 @@ export interface ParsedImagesRequest {
   /** Rebuilds the forwarding request with the resolved model in the body. */
   createRequest: (model: string) => Request
   model: string
-  /** Unchanged request, forwarded as-is when no rebuild is needed. */
-  originalRequest?: Request
 }
 
 function getContentMetadata(headers: Headers) {
@@ -131,6 +130,7 @@ export async function routeImagesRequest(
 ): Promise<Response> {
   const requestedModel = parsed.model
   const mappedModel = imageRouteDependencies.resolveMappedModel(requestedModel)
+  assertAllowedModel(mappedModel)
   if (mappedModel !== requestedModel) {
     consola.debug(`Resolved model mapping: ${requestedModel} -> ${mappedModel}`)
   }
@@ -159,20 +159,12 @@ export async function routeImagesRequest(
     consola.debug(
       `Provider '${providerModelAlias.provider}' not found or disabled; forwarding the original model to Codex`,
     )
+    assertAllowedModel(requestedModel)
     return await handleCodexImages(
       c,
       operation,
       undefined,
-      parsed.originalRequest ?? parsed.createRequest(requestedModel),
-    )
-  }
-
-  if (parsed.originalRequest && mappedModel === requestedModel) {
-    return await handleCodexImages(
-      c,
-      operation,
-      undefined,
-      parsed.originalRequest,
+      parsed.createRequest(requestedModel),
     )
   }
 

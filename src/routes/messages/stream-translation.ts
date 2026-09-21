@@ -11,14 +11,19 @@ import {
 } from "~/lib/types/anthropic"
 import { mapOpenAIStopReasonToAnthropic } from "./utils"
 
-function isToolBlockOpen(state: AnthropicStreamState): boolean {
-  if (!state.contentBlockOpen) {
-    return false
+const MAX_STREAM_TOOL_CALLS = 128
+const MAX_PENDING_STREAM_BYTES = 1024 * 1024
+const MAX_TOOL_IDENTITY_BYTES = 16 * 1024
+
+class InvalidToolCallStreamError extends Error {
+  constructor() {
+    super("Malformed tool call stream")
+    this.name = "InvalidToolCallStreamError"
   }
-  // Check if the current block index corresponds to any known tool call
-  return Object.values(state.toolCalls).some(
-    (tc) => tc.anthropicBlockIndex === state.contentBlockIndex,
-  )
+}
+
+function isToolBlockOpen(state: AnthropicStreamState): boolean {
+  return state.contentBlockOpen && Boolean(state.toolBlockOpen)
 }
 
 export function translateChunkToAnthropicEvents(
@@ -92,6 +97,9 @@ function handleFinish(
 ) {
   const { events, chunk } = context
   if (choice.finish_reason && choice.finish_reason.length > 0) {
+    if (hasPendingToolCall(state)) {
+      throw new InvalidToolCallStreamError()
+    }
     if (state.contentBlockOpen) {
       const toolBlockOpen = isToolBlockOpen(state)
       context.events.push({
@@ -99,6 +107,7 @@ function handleFinish(
         index: state.contentBlockIndex,
       })
       state.contentBlockOpen = false
+      state.toolBlockOpen = false
       state.contentBlockIndex++
       if (!toolBlockOpen) {
         handleReasoningOpaque(choice.delta, events, state)
@@ -168,46 +177,109 @@ function handleToolCalls(
     handleReasoningOpaqueInToolCalls(state, events, delta)
 
     for (const toolCall of delta.tool_calls) {
-      if (toolCall.id && toolCall.function?.name) {
-        // New tool call starting.
+      if (!Number.isSafeInteger(toolCall.index) || toolCall.index < 0) {
+        throw new InvalidToolCallStreamError()
+      }
+      const existing =
+        Object.hasOwn(state.toolCalls, toolCall.index) ?
+          state.toolCalls[toolCall.index]
+        : undefined
+      if (
+        !existing
+        && Object.keys(state.toolCalls).length >= MAX_STREAM_TOOL_CALLS
+      ) {
+        throw new InvalidToolCallStreamError()
+      }
+      const info = existing ?? {
+        id: "",
+        name: "",
+        anthropicBlockIndex: -1,
+        pendingArgs: [],
+        pendingArgsBytes: 0,
+      }
+      if (!existing) {
+        state.toolCalls[toolCall.index] = info
+        state.pendingToolCallCount = (state.pendingToolCallCount ?? 0) + 1
+      }
+
+      if (toolCall.id) {
+        if (Buffer.byteLength(toolCall.id) > MAX_TOOL_IDENTITY_BYTES) {
+          throw new InvalidToolCallStreamError()
+        }
+        info.id = toolCall.id
+      }
+      if (toolCall.function?.name) {
+        if (
+          Buffer.byteLength(toolCall.function.name) > MAX_TOOL_IDENTITY_BYTES
+        ) {
+          throw new InvalidToolCallStreamError()
+        }
+        info.name = toolCall.function.name
+      }
+
+      // Open the tool_use block only after both identity fields are known.
+      if (info.anthropicBlockIndex === -1 && info.id && info.name) {
         if (state.contentBlockOpen) {
-          // Close any previously open block.
           events.push({
             type: "content_block_stop",
             index: state.contentBlockIndex,
           })
           state.contentBlockIndex++
           state.contentBlockOpen = false
+          state.toolBlockOpen = false
         }
 
-        const anthropicBlockIndex = state.contentBlockIndex
-        state.toolCalls[toolCall.index] = {
-          id: toolCall.id,
-          name: toolCall.function.name,
-          anthropicBlockIndex,
-        }
+        info.anthropicBlockIndex = state.contentBlockIndex
+        state.pendingToolCallCount = Math.max(
+          0,
+          (state.pendingToolCallCount ?? 0) - 1,
+        )
 
         events.push({
           type: "content_block_start",
-          index: anthropicBlockIndex,
+          index: info.anthropicBlockIndex,
           content_block: {
             type: "tool_use",
-            id: toolCall.id,
-            name: toolCall.function.name,
+            id: info.id,
+            name: info.name,
             input: {},
           },
         })
         state.contentBlockOpen = true
+        state.toolBlockOpen = true
+
+        if (info.pendingArgs.length > 0) {
+          events.push({
+            type: "content_block_delta",
+            index: info.anthropicBlockIndex,
+            delta: {
+              type: "input_json_delta",
+              partial_json: info.pendingArgs.join(""),
+            },
+          })
+          info.pendingArgs.length = 0
+          state.pendingToolCallBytes = Math.max(
+            0,
+            (state.pendingToolCallBytes ?? 0) - info.pendingArgsBytes,
+          )
+          info.pendingArgsBytes = 0
+        }
       }
 
       if (toolCall.function?.arguments) {
-        const toolCallInfo = state.toolCalls[toolCall.index]
-        // Tool call can still be empty
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-        if (toolCallInfo) {
+        if (info.anthropicBlockIndex === -1) {
+          const argumentBytes = Buffer.byteLength(toolCall.function.arguments)
+          const pendingBytes = state.pendingToolCallBytes ?? 0
+          if (pendingBytes + argumentBytes > MAX_PENDING_STREAM_BYTES) {
+            throw new InvalidToolCallStreamError()
+          }
+          info.pendingArgs.push(toolCall.function.arguments)
+          info.pendingArgsBytes += argumentBytes
+          state.pendingToolCallBytes = pendingBytes + argumentBytes
+        } else {
           events.push({
             type: "content_block_delta",
-            index: toolCallInfo.anthropicBlockIndex,
+            index: info.anthropicBlockIndex,
             delta: {
               type: "input_json_delta",
               partial_json: toolCall.function.arguments,
@@ -231,6 +303,7 @@ function handleReasoningOpaqueInToolCalls(
     })
     state.contentBlockIndex++
     state.contentBlockOpen = false
+    state.toolBlockOpen = false
   }
   handleReasoningOpaque(delta, events, state)
 }
@@ -243,8 +316,19 @@ function handleContent(
   if (delta.content && delta.content.length > 0) {
     closeThinkingBlockIfOpen(state, events)
 
-    if (isToolBlockOpen(state) || hasToolCallDelta(delta)) {
-      state.deferredContent = `${state.deferredContent ?? ""}${delta.content}`
+    if (
+      isToolBlockOpen(state)
+      || hasToolCallDelta(delta)
+      || hasPendingToolCall(state)
+    ) {
+      const contentBytes = Buffer.byteLength(delta.content)
+      const deferredContentBytes = state.deferredContentBytes ?? 0
+      if (deferredContentBytes + contentBytes > MAX_PENDING_STREAM_BYTES) {
+        throw new InvalidToolCallStreamError()
+      }
+      state.deferredContent ??= []
+      state.deferredContent.push(delta.content)
+      state.deferredContentBytes = deferredContentBytes + contentBytes
       return
     }
 
@@ -258,6 +342,7 @@ function handleContent(
         },
       })
       state.contentBlockOpen = true
+      state.toolBlockOpen = false
     }
 
     events.push({
@@ -270,7 +355,7 @@ function handleContent(
     })
   }
 
-  // handle for claude model
+  // Preserve opaque reasoning signatures on Anthropic-compatible streams.
   if (
     delta.content === ""
     && delta.reasoning_opaque
@@ -300,6 +385,10 @@ function hasToolCallDelta(delta: Delta): boolean {
   return Boolean(delta.tool_calls && delta.tool_calls.length > 0)
 }
 
+function hasPendingToolCall(state: AnthropicStreamState): boolean {
+  return (state.pendingToolCallCount ?? 0) > 0
+}
+
 function flushDeferredContent(
   state: AnthropicStreamState,
   events: Array<AnthropicStreamEventData>,
@@ -326,7 +415,7 @@ function flushDeferredContent(
       index: state.contentBlockIndex,
       delta: {
         type: "text_delta",
-        text: state.deferredContent,
+        text: state.deferredContent.join(""),
       },
     },
     {
@@ -335,7 +424,9 @@ function flushDeferredContent(
     },
   )
   state.deferredContent = undefined
+  state.deferredContentBytes = 0
   state.contentBlockOpen = false
+  state.toolBlockOpen = false
   state.contentBlockIndex++
 }
 
@@ -426,7 +517,7 @@ function handleThinkingText(
   if (reasoningText && reasoningText.length > 0) {
     // compatible with copilot API returning content->reasoning_text->reasoning_opaque in different deltas
     // this is an extremely abnormal situation, probably a server-side bug
-    // only occurs in the claude model, with a very low probability of occurrence
+    // Some upstreams emit this rarely at the end of a reasoning block.
     if (state.contentBlockOpen) {
       delta.content = reasoningText
       delta.reasoning_text = undefined

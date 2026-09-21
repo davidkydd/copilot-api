@@ -13,8 +13,9 @@ import {
   readGitHubToken,
   readGitHubTokenFromEnv,
 } from "./lib/credential-store"
-import { getLatestModelForFamily } from "./lib/models"
+import { isAllowedModel } from "./lib/model-admission"
 import { initOpencodeVersion } from "./lib/opencode"
+import type { Model } from "./lib/types/models"
 import { ensurePaths } from "./lib/paths"
 import { initProxyFromEnv } from "./lib/proxy"
 import {
@@ -91,7 +92,10 @@ async function setupCopilotMode(
   await cacheModels()
 
   consola.info(
-    `Available models: \n${state.models?.data.map((model) => `- ${model.id}`).join("\n")}`,
+    `Available models: \n${state.models?.data
+      .filter((model) => isAllowedModel(model.id))
+      .map((model) => `- ${model.id}`)
+      .join("\n")}`,
   )
 
   if (claudeCode) {
@@ -99,35 +103,59 @@ async function setupCopilotMode(
   }
 }
 
+const CLAUDE_CODE_MODEL_ENDPOINTS = new Set([
+  "/chat/completions",
+  "/responses",
+  "/v1/messages",
+  "ws:/responses",
+])
+
+function isSafeClaudeCodeModelId(modelId: string): boolean {
+  return /^[A-Za-z0-9]/u.test(modelId) && !/[^A-Za-z0-9._:/-]/u.test(modelId)
+}
+
+export function selectClaudeCodeModel(
+  models: Array<Pick<Model, "id" | "supported_endpoints">>,
+): string | undefined {
+  const languageModels = models.filter(
+    (model) =>
+      isAllowedModel(model.id)
+      && isSafeClaudeCodeModelId(model.id)
+      && model.supported_endpoints?.some((endpoint) =>
+        CLAUDE_CODE_MODEL_ENDPOINTS.has(endpoint),
+      ),
+  )
+
+  return (
+    languageModels.find((model) => /^gpt(?:[-_.]|$)/iu.test(model.id.trim()))
+      ?.id ?? languageModels[0]?.id
+  )
+}
+
 function runClaudeCode(serverUrl: string): void {
   consola.log(
-    "\n💡 Tip: The --claude-code flag simply generates a clipboard command for launching Claude Code. \n"
-      + "All models remain fully accessible without this flag, just configure the model ID directly in your settings.json file.",
+    "\n💡 Tip: The --claude-code flag generates a clipboard command for launching Claude Code against this gateway. \n"
+      + "Only OpenAI and Microsoft MAI model IDs are accepted.",
   )
 
   invariant(state.models, "Models should be loaded by now")
 
-  // Default to the latest available model for each Claude Code size tier so
-  // opus maps to opus, sonnet maps to sonnet, and haiku maps to haiku.
-  const opusModel = getLatestModelForFamily("opus")?.id
-  const sonnetModel = getLatestModelForFamily("sonnet")?.id
-  const haikuModel = getLatestModelForFamily("haiku")?.id
-
-  consola.info(
-    "Selected default Claude Code models:\n"
-      + `- Opus:   ${opusModel ?? "(none available)"}\n`
-      + `- Sonnet: ${sonnetModel ?? "(none available)"}\n`
-      + `- Haiku:  ${haikuModel ?? "(none available)"}`,
+  const defaultModel = selectClaudeCodeModel(state.models.data)
+  invariant(
+    defaultModel,
+    "No OpenAI or Microsoft MAI model is available for Claude Code",
   )
+
+  consola.info(`Selected Claude Code gateway model: ${defaultModel}`)
 
   const command = generateEnvScript(
     {
       ANTHROPIC_BASE_URL: serverUrl,
       ANTHROPIC_AUTH_TOKEN: "dummy",
-      ANTHROPIC_MODEL: sonnetModel ?? opusModel,
-      ANTHROPIC_DEFAULT_OPUS_MODEL: opusModel,
-      ANTHROPIC_DEFAULT_SONNET_MODEL: sonnetModel,
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: haikuModel,
+      ANTHROPIC_MODEL: defaultModel,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: defaultModel,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: defaultModel,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: defaultModel,
       CLAUDE_CODE_USE_VERTEX: "0",
       CLAUDE_CODE_USE_BEDROCK: "0",
       DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1",

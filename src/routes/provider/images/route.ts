@@ -2,10 +2,16 @@ import { Hono, type Context } from "hono"
 
 import { forwardError } from "~/lib/error"
 import { createHandlerLogger } from "~/lib/logger"
+import { assertAllowedModel, ModelNotAllowedError } from "~/lib/model-admission"
 import { resolveProviderConfig } from "~/lib/provider-resolver"
-import { handleCodexImages } from "~/routes/images/route"
-import type { CodexImagesOperation } from "~/services/codex/images"
 import { forwardProviderImagesWithLogging } from "~/routes/images/forward-provider-images"
+import { withParsedImagesRequest } from "~/routes/images/parsed-request"
+import { handleCodexImages } from "~/routes/images/shared"
+import {
+  InvalidMultipartBodyError,
+  MultipartBodyTooLargeError,
+} from "~/routes/images/temp-form-data"
+import type { CodexImagesOperation } from "~/services/codex/images"
 
 const logger = createHandlerLogger("provider-images-handler")
 
@@ -31,17 +37,43 @@ async function handleProviderImages(
       )
     }
 
-    if (providerConfig.name === "codex") {
-      return await handleCodexImages(c, operation, providerConfig)
-    }
-
-    return await forwardProviderImagesWithLogging(
-      providerConfig,
+    return await withParsedImagesRequest(
       c.req.raw,
       operation,
-      { logger, provider },
+      async (parsed) => {
+        if (parsed instanceof Request) {
+          throw new ModelNotAllowedError()
+        }
+        assertAllowedModel(parsed.model)
+
+        const request = parsed.createRequest(parsed.model)
+        if (providerConfig.name === "codex") {
+          return await handleCodexImages(c, operation, providerConfig, request)
+        }
+        return await forwardProviderImagesWithLogging(
+          providerConfig,
+          request,
+          operation,
+          { logger, provider },
+        )
+      },
     )
   } catch (error) {
+    if (
+      error instanceof InvalidMultipartBodyError
+      || error instanceof MultipartBodyTooLargeError
+    ) {
+      return c.json(
+        {
+          error: {
+            message: error.message,
+            type: "invalid_request_error",
+          },
+        },
+        error instanceof MultipartBodyTooLargeError ? 413 : 400,
+      )
+    }
+
     logger.error(`provider.images.${operation}.error`, { provider, error })
     return await forwardError(c, error)
   }

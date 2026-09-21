@@ -18,9 +18,11 @@ const { forwardCodexAlphaSearch, resolveCodexAlphaSearchUrl } = await import(
 const { forwardCodexModels, getModels, resolveCodexModelsUrl } = await import(
   "~/services/codex/get-models"
 )
-const { alphaSearchRouteDependencies, alphaSearchRoutes } = await import(
-  "~/routes/alpha-search/route"
-)
+const {
+  alphaSearchRouteDependencies,
+  alphaSearchRoutes,
+  MAX_ALPHA_SEARCH_BODY_SIZE_BYTES,
+} = await import("~/routes/alpha-search/route")
 const { alphaSearchResponsesDependencies, resetAlphaSearchState } =
   await import("~/routes/alpha-search/alpha-search-responses")
 const { providerAlphaSearchRouteDependencies, providerAlphaSearchRoutes } =
@@ -464,6 +466,48 @@ describe("Codex alpha search forwarding", () => {
     expect(await new Response(init?.body).json()).toEqual(alphaSearchPayload)
   })
 
+  test("rejects oversized alpha search bodies before forwarding", async () => {
+    for (const path of ["/alpha/search", "/openrouter/v1/alpha/search"]) {
+      fetchMock.mockClear()
+      const response = await createApp().request(
+        new Request(`http://localhost${path}`, {
+          method: "POST",
+          headers: {
+            "content-length": String(MAX_ALPHA_SEARCH_BODY_SIZE_BYTES + 1),
+            "content-type": "application/json",
+          },
+          body: "{}",
+        }),
+      )
+
+      expect(response.status).toBe(413)
+      expect(fetchMock).not.toHaveBeenCalled()
+    }
+  })
+
+  test("forwards only the validated model from duplicate-key bodies", async () => {
+    for (const path of [
+      "/codex/v1/alpha/search",
+      "/openrouter/v1/alpha/search",
+    ]) {
+      fetchMock.mockClear()
+      const response = await createApp().request(path, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: '{"model":"claude-opus-4.7","model":"gpt-5.6-sol","input":[]}',
+      })
+
+      expect(response.status).toBe(200)
+      const [, init] = fetchMock.mock.calls[0] ?? []
+      const forwardedBody = await new Response(init?.body).text()
+      expect(forwardedBody).not.toContain("claude-opus")
+      expect(JSON.parse(forwardedBody)).toEqual({
+        model: "gpt-5.6-sol",
+        input: [],
+      })
+    }
+  })
+
   test("reads request and response bodies when debug logging is enabled", async () => {
     state.verbose = true
 
@@ -602,7 +646,7 @@ describe("Alpha search Responses adapter", () => {
       body: JSON.stringify(
         createFallbackPayload(
           { search_query: [{ q: "non-gpt model" }] },
-          { model: "claude-opus-4.1" },
+          { model: "mai-1-preview" },
         ),
       ),
     })
@@ -1032,6 +1076,27 @@ describe("Alpha search Responses adapter", () => {
     expect(body.error.message).toContain(
       "Configured alphaSearchModel 'gpt-5-mini' does not support the Responses endpoint",
     )
+    expect(createResponsesMock).not.toHaveBeenCalled()
+  })
+
+  test("rejects a disallowed configured alpha search fallback", async () => {
+    alphaSearchRouteDependencies.getAlphaSearchModel = () => "CLAUDE-opus-4"
+    state.models = {
+      object: "list",
+      data: [
+        {
+          capabilities: { limits: {} },
+          id: "gpt-5.6-sol",
+          supported_endpoints: ["/chat/completions"],
+        },
+      ],
+    } as typeof state.models
+
+    const response = await requestFallback(
+      createFallbackPayload({ search_query: [{ q: "blocked search" }] }),
+    )
+
+    expect(response.status).toBe(400)
     expect(createResponsesMock).not.toHaveBeenCalled()
   })
 

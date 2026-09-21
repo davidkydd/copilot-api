@@ -8,8 +8,10 @@ import type { SubagentMarker } from "~/lib/subagent"
 import type { Model } from "~/lib/types/models"
 
 import { debugJson, debugJsonTail, debugLazy } from "~/lib/logger"
+import { assertAllowedModelSelection } from "~/lib/model-admission"
 import { writeSSEIfConnected } from "~/lib/sse"
 import { resolveBridgeToolSearchName } from "~/lib/tool-search"
+import { createToolUseSseCapture } from "~/lib/tool-use-sse-capture"
 import {
   createCopilotTokenUsageRecorder,
   mergeAnthropicUsage,
@@ -128,6 +130,7 @@ export const handleWithChatCompletions = async (
   })
   debugJson(logger, "Translated OpenAI request payload:", openAIPayload)
 
+  assertAllowedModelSelection(openAIPayload)
   const response = await messagesApiFlowDependencies.createChatCompletions(
     openAIPayload,
     {
@@ -260,6 +263,7 @@ export const handleWithResponsesApi = async (
     getResponsesTransportForModel(selectedModel, {
       compactType: requestOptions.compactType,
     }) ?? "http"
+  assertAllowedModelSelection(responsesPayload)
   const response = await messagesApiFlowDependencies.createResponses(
     responsesPayload,
     {
@@ -386,6 +390,7 @@ export const handleWithMessagesApi = async (
 
   debugJson(logger, "Translated Messages payload:", anthropicPayload)
 
+  assertAllowedModelSelection(anthropicPayload)
   const response = await messagesApiFlowDependencies.createMessages(
     anthropicPayload,
     anthropicBetaHeader,
@@ -404,6 +409,7 @@ export const handleWithMessagesApi = async (
       let usage: UsageTokens = {}
       let messageStopSeen = false
       let errorSeen = false
+      const capture = createToolUseSseCapture()
 
       try {
         for await (const event of response) {
@@ -436,6 +442,7 @@ export const handleWithMessagesApi = async (
           } else if (parsedEvent?.type === "error" || eventName === "error") {
             errorSeen = true
           }
+          capture?.record(data)
           await writeSSEIfConnected(stream, {
             event: eventName,
             data,
@@ -444,6 +451,8 @@ export const handleWithMessagesApi = async (
       } catch (error) {
         logger.warn("Messages stream interrupted:", error)
       }
+
+      capture?.finish()
 
       if (!messageStopSeen && !errorSeen) {
         logger.warn(
